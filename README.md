@@ -1,4 +1,4 @@
-# Dự án Phân tích Giao dịch (Tên dự án của bạn)
+# Dự án Phân tích Giao dịch (Tên dự án: Transaction Analysis Project)
 
 Dự án này sử dụng mô hình Học máy (Machine Learning) để phân tích dữ liệu giao dịch và dự đoán gian lận. 
 
