@@ -1,217 +1,164 @@
-"""
-Data Loading and Preprocessing Module
-Handles loading of all CSV files and basic preprocessing
-"""
-
-import pandas as pd
-import numpy as np
+"""Validated CSV ingestion. Pure pandas functions; no UI or cache state."""
+from dataclasses import dataclass
 from pathlib import Path
-import streamlit as st
 
-# Base path
-BASE_PATH = Path(__file__).parent.parent
+import numpy as np
+import pandas as pd
 
-@st.cache_data
-def load_all_data(use_sample=True):
-    """
-    Load all datasets for the dashboard
+ROOT = Path(__file__).resolve().parents[1]
+TRANSACTION_FILES = ("transactions_data.csv", "transactions_data_25pc.csv", "transactions_data_10pc.csv")
+REQUIRED = {
+    "users": {"id", "current_age", "yearly_income", "total_debt", "credit_score"},
+    "cards": {"id", "client_id", "card_type", "card_brand"},
+    "transactions": {"id", "client_id", "card_id", "date", "amount", "mcc", "use_chip"},
+    "mcc": {"mcc_code", "merchant_category"},
+    "labels": {"id", "label"},
+}
 
-    Args:
-        use_sample (bool): If True, use 25% sample for transactions, else use full dataset
 
-    Returns:
-        tuple: (df_trans, df_cards, df_users, df_fraud, df_mcc)
-    """
-    # Select transactions file
-    trans_file = 'transactions_data_25pc.csv' if use_sample else 'transactions_data.csv'
+class DataValidationError(ValueError):
+    """An input violates the documented data contract."""
 
-    # Load data with optimized dtypes
-    print(f"Loading {trans_file}...")
-    df_trans = pd.read_csv(
-        BASE_PATH / trans_file,
-        dtype={
-            'id': 'int32',
-            'client_id': 'int16',
-            'card_id': 'int16',
-            # 'amount' will be cleaned in preprocessing
-            'use_chip': 'category',
-            'merchant_id': 'int32',
-            'merchant_city': 'category',
-            'merchant_state': 'category',
-            'zip': 'str',
-            'mcc': 'int16'
-        },
-        parse_dates=['date']
-    )
 
-    print("Loading cards_data.csv...")
-    df_cards = pd.read_csv(
-        BASE_PATH / 'cards_data.csv',
-        dtype={
-            'id': 'int16',
-            'client_id': 'int16',
-            'card_brand': 'category',
-            'card_type': 'category',
-            'has_chip': 'category',
-            'card_on_dark_web': 'category'
-        },
-        parse_dates=['expires', 'acct_open_date']
-    )
+@dataclass
+class AnalysisData:
+    transactions: pd.DataFrame
+    users: pd.DataFrame
+    cards: pd.DataFrame
+    quality: pd.DataFrame
+    source: str
 
-    print("Loading users_data.csv...")
-    df_users = pd.read_csv(
-        BASE_PATH / 'users_data.csv',
-        dtype={
-            'id': 'int16',
-            'current_age': 'int8',
-            'retirement_age': 'int8',
-            'birth_year': 'int16',
-            'birth_month': 'int8',
-            'gender': 'category',
-            'num_credit_cards': 'int8'
-        }
-    )
 
-    print("Loading train_fraud_labels.csv...")
-    df_fraud = pd.read_csv(
-        BASE_PATH / 'train_fraud_labels.csv',
-        dtype={
-            'id': 'int32'
-            # 'label' will be converted in preprocessing
-        }
-    )
-    # Convert label column: 'Yes' -> 1, 'No' -> 0
-    df_fraud['target'] = (df_fraud['label'] == 'Yes').astype('int8')
+def source_files(directory):
+    directory = Path(directory)
+    candidates = [directory / name for name in TRANSACTION_FILES if (directory / name).is_file()]
+    if len(candidates) != 1:
+        raise DataValidationError(
+            "Keep exactly one transaction CSV in the data folder: " + ", ".join(TRANSACTION_FILES)
+        )
+    paths = {"transactions": candidates[0]}
+    for key, name in (("users", "users_data.csv"), ("cards", "cards_data.csv"), ("mcc", "mcc_codes.csv")):
+        paths[key] = directory / name
+        if not paths[key].is_file():
+            raise DataValidationError(f"Missing file: {name}")
+    label_path = directory / "train_fraud_labels.csv"
+    if label_path.is_file():
+        paths["labels"] = label_path
+    return paths
 
-    print("Loading mcc_codes.csv...")
-    df_mcc = pd.read_csv(
-        BASE_PATH / 'mcc_codes.csv',
-        dtype={
-            'mcc_code': 'int16',
-            'merchant_category': 'str'
-        }
-    )
 
-    # Basic preprocessing
-    df_trans = preprocess_transactions(df_trans)
-    df_users = preprocess_users(df_users)
-    df_cards = preprocess_cards(df_cards)
+def file_signature(directory):
+    """Include file identity/size/mtime in the Streamlit cache key."""
+    return tuple((key, str(p.resolve()), p.stat().st_size, p.stat().st_mtime_ns)
+                 for key, p in sorted(source_files(directory).items()))
 
-    print("Data loading complete!")
-    return df_trans, df_cards, df_users, df_fraud, df_mcc
 
-def preprocess_transactions(df):
-    """Preprocess transactions data"""
-    # Clean amount column (remove $ and convert to float)
-    if df['amount'].dtype == 'object':
-        df['amount'] = df['amount'].str.replace('$', '', regex=False).str.replace(',', '', regex=False).astype('float32')
+def money(series, name):
+    cleaned = series.astype("string").str.replace(r"[$,]", "", regex=True).str.strip()
+    values = pd.to_numeric(cleaned, errors="coerce").astype(float)
+    if values.isna().any() or not np.isfinite(values).all():
+        raise DataValidationError(f"{name}: missing or invalid numeric value")
+    return values
+
+
+def integer(series, name):
+    values = pd.to_numeric(series, errors="coerce")
+    if values.isna().any() or not np.isfinite(values).all() or (values % 1 != 0).any():
+        raise DataValidationError(f"{name}: expected non-missing integer IDs")
+    return values.astype("int64")
+
+
+def normalize_labels(series):
+    mapping = {"yes": 1, "no": 0, "1": 1, "0": 0, "1.0": 1, "0.0": 0}
+    cleaned = series.astype("string").str.strip().str.lower().replace("", pd.NA)
+    invalid = cleaned.notna() & ~cleaned.isin(mapping)
+    if invalid.any():
+        raise DataValidationError("labels.label: expected Yes/No, 1/0 or missing")
+    return cleaned.map(mapping).astype("Int8")
+
+
+def prepare_tables(tables, source="custom"):
+    """Validate keys before joins; preserve unknown labels and transaction row count."""
+    data = {key: frame.copy() for key, frame in tables.items()}
+    data.setdefault("labels", pd.DataFrame(columns=["id", "label"]))
+    for key, columns in REQUIRED.items():
+        if key not in data:
+            raise DataValidationError(f"Missing table: {key}")
+        missing = columns - set(data[key].columns)
+        if missing:
+            raise DataValidationError(f"{key}: missing columns {sorted(missing)}")
+        pk = "mcc_code" if key == "mcc" else "id"
+        data[key][pk] = integer(data[key][pk], f"{key}.{pk}")
+        if data[key][pk].duplicated().any():
+            raise DataValidationError(f"{key}.{pk}: duplicate primary keys")
+
+    trans, users, cards, mcc, labels = (data[k] for k in ("transactions", "users", "cards", "mcc", "labels"))
+    if trans.empty:
+        raise DataValidationError("transactions: the input is empty")
+    for key in ("client_id", "card_id", "mcc"):
+        trans[key] = integer(trans[key], f"transactions.{key}")
+    cards["client_id"] = integer(cards["client_id"], "cards.client_id")
+    trans["date"] = pd.to_datetime(trans["date"], errors="coerce", format="mixed")
+    if trans["date"].isna().any():
+        raise DataValidationError("transactions.date: invalid or missing date")
+    if not pd.api.types.is_datetime64_any_dtype(trans["date"]) or trans["date"].dt.tz is not None:
+        raise DataValidationError("transactions.date: normalize to timezone-naive timestamps before import")
+    trans["amount"] = money(trans["amount"], "transactions.amount")
+    for col in ("yearly_income", "total_debt", "current_age", "credit_score"):
+        users[col] = money(users[col], f"users.{col}")
+    if ((users["current_age"] < 0) | (users["current_age"] > 120)).any():
+        raise DataValidationError("users.current_age: expected 0..120")
+    users["debt_to_income"] = users["total_debt"].div(users["yearly_income"].where(users["yearly_income"] > 0))
+    users["age_group"] = pd.cut(users["current_age"], [0, 25, 35, 45, 55, 65, 120],
+                                labels=["0–25", "26–35", "36–45", "46–55", "56–65", "66+"], include_lowest=True)
+    labels["is_fraud"] = normalize_labels(labels["label"])
+    if "errors" in trans:
+        error_text = trans["errors"].astype("string").fillna("").str.strip().str.lower()
+        trans["has_error"] = ~error_text.isin(["", "no error", "none", "nan"])
     else:
-        df['amount'] = df['amount'].astype('float32')
+        trans["has_error"] = False
+    trans["is_purchase"] = trans["amount"].gt(0) & ~trans["has_error"]
 
-    # Extract date components
-    df['year'] = df['date'].dt.year
-    df['month'] = df['date'].dt.month
-    df['day_of_week'] = df['date'].dt.dayofweek
-    df['hour'] = df['date'].dt.hour
-    df['quarter'] = df['date'].dt.quarter
+    # Only analytical fields enter the app, never card numbers, CVV or addresses.
+    users = users[["id", "current_age", "age_group", "yearly_income", "total_debt", "credit_score", "debt_to_income"]].copy()
+    cards = cards[["id", "client_id", "card_type", "card_brand"]].copy()
+    merged = trans.merge(labels[["id", "is_fraud"]], on="id", how="left", validate="one_to_one")
+    merged = merged.merge(cards.rename(columns={"id": "card_id"}), on=["card_id", "client_id"],
+                          how="left", validate="many_to_one", indicator="card_match")
+    merged = merged.merge(users.rename(columns={"id": "client_id"}), on="client_id", how="left",
+                          validate="many_to_one", indicator="user_match")
+    merged = merged.merge(mcc, left_on="mcc", right_on="mcc_code", how="left",
+                          validate="many_to_one", indicator="mcc_match")
+    merged["merchant_category"] = merged["merchant_category"].fillna("Unknown category")
+    merged["card_type"] = merged["card_type"].fillna("Unknown card")
+    merged["card_brand"] = merged["card_brand"].fillna("Unknown brand")
+    for column in ("merchant_state", "merchant_city"):
+        if column not in merged:
+            merged[column] = "Unknown"
+        merged[column] = merged[column].fillna("Unknown")
+    merged["year"] = merged["date"].dt.year
+    merged["month"] = merged["date"].dt.to_period("M").astype(str)
 
-    # Handle errors column
-    df['has_error'] = df['errors'].notna().astype('int8')
+    checks = []
+    def check(name, count, detail, warn=True):
+        checks.append({"check": name, "count": int(count), "status": "Review" if count and warn else "Pass", "detail": detail})
+    check("Transaction row preservation", len(merged) - len(trans), "Joins must not duplicate or drop transactions")
+    for name in ("card", "user", "mcc"):
+        check(f"Unmatched {name} references", merged[f"{name}_match"].ne("both").sum(), "Retained and reported; investigate source keys")
+    check("Unlabeled transactions", merged["is_fraud"].isna().sum(), "Excluded from fraud-rate denominator")
+    check("Unused label IDs", (~labels["id"].isin(trans["id"])).sum(), "May be expected for a transaction sample")
+    check("Refund / reversal rows", trans["amount"].lt(0).sum(), "Included in net value; excluded from purchase RFM", False)
+    check("Rows with transaction errors", trans["has_error"].sum(), "Excluded from settled value and purchase RFM", False)
+    check("Nonpositive income", users["yearly_income"].le(0).sum(), "Debt-to-income left unknown")
+    return AnalysisData(merged, users, cards, pd.DataFrame(checks), source)
 
-    return df
 
-def preprocess_users(df):
-    """Preprocess users data"""
-    # Clean currency columns (remove $ and convert to numeric)
-    currency_cols = ['per_capita_income', 'yearly_income', 'total_debt']
-    for col in currency_cols:
-        if df[col].dtype == 'object':
-            df[col] = df[col].str.replace('$', '', regex=False).str.replace(',', '', regex=False).astype('float64')
+def load_data(directory):
+    paths = source_files(directory)
+    tables = {}
+    for key, path in paths.items():
+        optional = {"transactions": {"errors", "merchant_state", "merchant_city"}}
+        allowed = REQUIRED[key] | optional.get(key, set())
+        tables[key] = pd.read_csv(path, usecols=lambda name: name in allowed)
+    return prepare_tables(tables, str(Path(directory).resolve()))
 
-    # Create age groups
-    df['age_group'] = pd.cut(
-        df['current_age'],
-        bins=[0, 25, 35, 45, 55, 65, 120],
-        labels=['18-25', '26-35', '36-45', '46-55', '56-65', '65+']
-    )
-
-    # Create income tiers
-    df['income_tier'] = pd.qcut(
-        df['yearly_income'],
-        q=3,
-        labels=['Low', 'Medium', 'High'],
-        duplicates='drop'
-    )
-
-    # Debt to income ratio
-    df['debt_to_income'] = df['total_debt'] / df['yearly_income']
-    df['debt_to_income'] = df['debt_to_income'].replace([np.inf, -np.inf], np.nan)
-
-    # Credit score categories
-    df['credit_category'] = pd.cut(
-        df['credit_score'],
-        bins=[0, 600, 700, 750, 850],
-        labels=['Poor', 'Fair', 'Good', 'Excellent']
-    )
-
-    return df
-
-def preprocess_cards(df):
-    """Preprocess cards data"""
-    # Clean credit_limit column (remove $ and convert to numeric)
-    if 'credit_limit' in df.columns and df['credit_limit'].dtype == 'object':
-        df['credit_limit'] = df['credit_limit'].str.replace('$', '', regex=False).str.replace(',', '', regex=False).astype('float64')
-
-    # Extract account open year
-    df['acct_open_year'] = df['acct_open_date'].dt.year
-
-    # Card age (as of 2019, end of data period)
-    df['card_age_years'] = 2019 - df['acct_open_year']
-
-    return df
-
-@st.cache_data
-def get_merged_data(_df_trans, _df_cards, _df_users, _df_fraud, _df_mcc):
-    """
-    Merge all datasets for comprehensive analysis
-
-    Returns:
-        DataFrame: Merged dataset with all information
-    """
-    # Start with transactions
-    df = _df_trans.copy()
-
-    # Merge with fraud labels
-    df = df.merge(_df_fraud[['id', 'target']], on='id', how='left', suffixes=('', '_fraud'))
-    df['is_fraud'] = df['target'].fillna(0).astype('int8')
-    df.drop('target', axis=1, inplace=True, errors='ignore')
-
-    # Merge with MCC codes
-    df = df.merge(_df_mcc, left_on='mcc', right_on='mcc_code', how='left')
-
-    # Merge with cards
-    df = df.merge(
-        _df_cards[['id', 'client_id', 'card_type', 'card_brand', 'credit_limit',
-                   'has_chip', 'card_on_dark_web', 'card_age_years']],
-        left_on='card_id',
-        right_on='id',
-        how='left',
-        suffixes=('', '_card')
-    )
-
-    # Merge with users
-    df = df.merge(
-        _df_users[['id', 'current_age', 'age_group', 'gender', 'yearly_income',
-                   'income_tier', 'total_debt', 'debt_to_income', 'credit_score',
-                   'credit_category', 'num_credit_cards']],
-        left_on='client_id',
-        right_on='id',
-        how='left',
-        suffixes=('', '_user')
-    )
-
-    return df
-
-def get_sample_data(df, n=10000):
-    """Get a random sample of data for testing"""
-    return df.sample(n=min(n, len(df)))

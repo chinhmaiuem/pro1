@@ -1,0 +1,5 @@
+# Validated together on Python 3.13; CI also checks Python 3.12.
+numpy==2.2.4
+pandas==3.0.2
+plotly==6.7.0
+streamlit==1.58.0

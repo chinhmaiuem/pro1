@@ -1,582 +1,240 @@
-"""
-Company X Financial Analytics Dashboard
-Module 2 Final Project - COLE.VN DS Course K06
+"""LedgerLens — a reproducible transaction analytics portfolio."""
+from pathlib import Path
+import math
 
-Main Streamlit application file
-"""
-
-import streamlit as st
 import pandas as pd
-import numpy as np
 import plotly.express as px
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-import warnings
-warnings.filterwarnings('ignore')
+import streamlit as st
 
-# Import custom modules
-from utils.data_loader import load_all_data, get_sample_data, get_merged_data
-from utils.segmentation import perform_rfm_segmentation, lifecycle_segmentation, financial_health_segmentation, calculate_customer_ltv
-from utils.visualizations import *
+from utils.analytics import kpis, monthly_summary, opportunity_lists, risk_by_group, safe_csv, segment_summary
+from utils.data_loader import ROOT, DataValidationError, file_signature, load_data
+from utils.segmentation import customer_profile
+from utils.visualizations import PALETTE, monthly_chart, polish, segment_chart
 
-# Page configuration
-st.set_page_config(
-    page_title="Company X Analytics Dashboard",
-    page_icon="📊",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
-
-# Custom CSS
+st.set_page_config(page_title="LedgerLens | Transaction Analytics", page_icon="◈", layout="wide")
 st.markdown("""
 <style>
-    .main-header {
-        font-size: 2.5rem;
-        font-weight: bold;
-        color: #1f77b4;
-        text-align: center;
-        padding: 1rem 0;
-    }
-    .sub-header {
-        font-size: 1.5rem;
-        font-weight: bold;
-        color: #2c3e50;
-        margin-top: 2rem;
-        margin-bottom: 1rem;
-    }
-    .metric-card {
-        background-color: #f0f2f6;
-        padding: 1rem;
-        border-radius: 0.5rem;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-    }
-    .insight-box {
-        background-color: #e8f4f8;
-        padding: 1rem;
-        border-left: 4px solid #1f77b4;
-        margin: 1rem 0;
-    }
+.stApp {background: #f5f7f8;}
+.block-container {padding-top: 2.4rem; max-width: 1450px;}
+h1, h2, h3 {color: #183745;}
+div[data-testid="stMetric"] {background: white; border: 1px solid #e0e7e8; border-radius: 12px; padding: 18px;}
+div[data-testid="stMetricLabel"] {color: #61737b;}
+.hero-label {color:#127f80; letter-spacing: .15em; font-size:.78rem; font-weight:700;}
+.hero-copy {color:#61737b; max-width:760px; line-height:1.6; margin-bottom: 1.3rem;}
+section[data-testid="stSidebar"] {background: #eaf0f1;}
 </style>
 """, unsafe_allow_html=True)
 
-# Session state initialization
-if 'data_loaded' not in st.session_state:
-    st.session_state.data_loaded = False
-if 'use_sample' not in st.session_state:
-    st.session_state.use_sample = True
 
-# Sidebar
+@st.cache_data(show_spinner=False, max_entries=3)
+def cached_data(directory, signature):
+    # Signature is intentionally hashed: changed files invalidate cached datasets.
+    return load_data(directory)
+
+
+def chart(fig, key):
+    st.plotly_chart(fig, width="stretch", key=key, config={"displaylogo": False})
+
+
+def table(frame, **kwargs):
+    st.dataframe(frame, width="stretch", hide_index=True, **kwargs)
+
+
+def download(frame, label, filename, key):
+    st.download_button(label, safe_csv(frame), filename, "text/csv", key=key)
+
+
+def usd(value):
+    return f"${value:,.0f}"
+
+
 with st.sidebar:
-    st.image("https://via.placeholder.com/300x100/1f77b4/ffffff?text=Company+X", width='stretch')
-    st.markdown("## ⚙️ Settings")
+    st.markdown("## ◈ LedgerLens")
+    st.caption("TRANSACTION INTELLIGENCE")
+    mode = st.selectbox("Data source", ["Synthetic demo", "Local dataset"], key="source")
+    if mode == "Synthetic demo":
+        directory = ROOT / "data" / "demo"
+        st.caption("240 fictional customers · 2018–2019")
+    else:
+        folder = st.text_input("Dataset folder", "data/full", help="Relative to the project folder, or an absolute local path.")
+        directory = Path(folder)
+        if not directory.is_absolute():
+            directory = ROOT / directory
+    if st.button("Reload data", width="stretch"):
+        cached_data.clear()
+    st.divider()
+    st.caption("Built with Python, pandas, SQL, Streamlit and Plotly.")
+    st.caption("Exploratory analysis · no trained fraud model")
 
-    # Data source selection
-    use_sample = st.checkbox("Use 25% Sample Data (Faster)", value=True,
-                            help="Recommended for faster loading. Uncheck to use full dataset.")
-    st.session_state.use_sample = use_sample
+st.markdown('<div class="hero-label">PORTFOLIO / CUSTOMER ANALYTICS</div>', unsafe_allow_html=True)
+st.title("Transactions into decisions.")
+st.markdown('<div class="hero-copy">Explore spending patterns, understand customer segments and prioritize the next business question — with traceable metrics and explicit data quality checks.</div>', unsafe_allow_html=True)
 
-    # Load data button
-    if st.button("🔄 Load/Reload Data", type="primary"):
-        with st.spinner("Loading data..."):
-            st.session_state.data_loaded = False
-            st.session_state.df_trans, st.session_state.df_cards, st.session_state.df_users, \
-            st.session_state.df_fraud, st.session_state.df_mcc = load_all_data(use_sample=use_sample)
-            st.session_state.data_loaded = True
-            st.success("✅ Data loaded successfully!")
-
-    st.markdown("---")
-    st.markdown("### 📊 Dashboard Sections")
-    st.markdown("""
-    - **Executive Summary**: Key insights at a glance
-    - **Customer Behavior**: 10 core behavior analyses
-    - **Segmentation**: 3 segmentation approaches
-    - **Segment Deep-Dive**: Behavior by segment
-    - **Strategy & Fraud**: Recommendations + Risk analysis
-    """)
-
-    st.markdown("---")
-    st.markdown("### 📖 About")
-    st.markdown("""
-    **Project**: Module 2 Final Project
-    **Course**: COLE.VN DS K06
-    **Dataset**: Financial transactions 2010-2019
-    **Questions Analyzed**: 25 core questions
-    """)
-
-# Main content
-st.markdown('<div class="main-header">📊 Company X Financial Analytics Dashboard</div>', unsafe_allow_html=True)
-
-# Check if data is loaded
-if not st.session_state.data_loaded:
-    st.warning("⚠️ Please load data using the button in the sidebar to begin analysis.")
-    st.info("""
-    **Getting Started:**
-    1. Click "Load/Reload Data" in the sidebar
-    2. Choose whether to use sample (25%) or full dataset
-    3. Wait for data to load
-    4. Explore the dashboard tabs
-    """)
+try:
+    with st.spinner("Validating and preparing data…"):
+        bundle = cached_data(str(directory.resolve()), file_signature(directory))
+except (DataValidationError, ValueError, OSError, pd.errors.ParserError) as exc:
+    st.error(f"Cannot load this dataset: {exc}")
+    st.info("Use Synthetic demo, or follow docs/DATA.md to prepare a local dataset.")
     st.stop()
 
-# Main tabs
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "📈 Executive Summary",
-    "👥 Customer Behavior",
-    "🎯 Segmentation",
-    "🔍 Segment Deep-Dive",
-    "💡 Strategy & Fraud"
-])
+raw = bundle.transactions
+is_demo = directory.resolve() == (ROOT / "data" / "demo").resolve()
+if is_demo:
+    st.info("SYNTHETIC DEMO · All records are generated for this portfolio. Findings describe this fictional sample only.")
+else:
+    st.warning("LOCAL DATA · Confirm provenance and permitted use. Sampling and label coverage can affect every conclusion.")
 
-# Tab 1: Executive Summary
-with tab1:
-    st.markdown('<div class="sub-header">Executive Summary</div>', unsafe_allow_html=True)
+with st.sidebar:
+    st.markdown("### Analysis scope")
+    dates = st.date_input("Transaction period", value=(raw["date"].min().date(), raw["date"].max().date()),
+                          min_value=raw["date"].min().date(), max_value=raw["date"].max().date())
+    types = sorted(raw["card_type"].dropna().unique().tolist())
+    selected_types = st.multiselect("Card types", types, default=types, key="card_types")
+    window_days = st.selectbox("RFM lookback · days", [365, 180, 90], key="lookback", help="Measured backwards from the day after the selected period ends.")
+    st.caption("Period and card filters apply to transaction views. RFM uses all card types for customers seen in that filtered scope.")
 
-    # Prepare merged data
-    with st.spinner("Preparing data for analysis..."):
-        if 'df_merged' not in st.session_state:
-            st.session_state.df_merged = get_merged_data(
-                st.session_state.df_trans,
-                st.session_state.df_cards,
-                st.session_state.df_users,
-                st.session_state.df_fraud,
-                st.session_state.df_mcc
-            )
+if len(dates) != 2:
+    st.info("Select both a start date and an end date.")
+    st.stop()
+start, end = pd.Timestamp(dates[0]), pd.Timestamp(dates[1]) + pd.Timedelta(days=1)
+scope = raw.loc[raw["date"].ge(start) & raw["date"].lt(end) & raw["card_type"].isin(selected_types)].copy()
+if scope.empty:
+    st.info("No transactions match these filters. Expand the period or select a card type.")
+    st.stop()
 
-        # Calculate RFM segmentation
-        if 'rfm_df' not in st.session_state:
-            st.session_state.rfm_df = perform_rfm_segmentation(st.session_state.df_trans)
+# Cohort membership follows the scope; RFM uses complete customer history up to the cutoff,
+# not only a selected card, which would misclassify multi-card customers.
+cohort_ids = scope["client_id"].unique()
+users = bundle.users.loc[bundle.users["id"].isin(cohort_ids)]
+history = raw.loc[raw["client_id"].isin(cohort_ids)]
+profile = customer_profile(history, users, bundle.cards, end, window_days)
+metrics = kpis(scope)
+summary = segment_summary(profile)
+retention, cross_sell = opportunity_lists(profile)
+coverage = metrics["label_coverage"]
+st.caption(f"{dates[0]:%d %b %Y} — {dates[1]:%d %b %Y}  /  {len(scope):,} transactions  /  {len(users):,} matched customers  /  USD")
 
-        # Calculate LTV
-        if 'ltv_df' not in st.session_state:
-            st.session_state.ltv_df = calculate_customer_ltv(
-                st.session_state.df_trans,
-                st.session_state.df_users
-            )
+cols = st.columns(4)
+for col, name, value in zip(cols,
+                            ["Net transaction value", "Purchasing customers", "Average purchase", "Fraud rate · labeled only"],
+                            [usd(metrics["net_value"]), f'{scope.loc[scope["is_purchase"], "client_id"].nunique():,}',
+                             usd(metrics["avg_purchase"]), f'{metrics["fraud_rate"]:.2%}' if metrics["fraud_rate"] is not None else "N/A"]):
+    col.metric(name, value)
+st.caption(f'Net value = successful purchases {usd(metrics["purchase_value"])} − refunds/reversals {usd(metrics["refund_value"])}. Label coverage: {coverage:.1%}. Transaction value is not bank revenue.')
 
-    # Key metrics row
-    col1, col2, col3, col4, col5 = st.columns(5)
+overview, segments, risk, actions, quality = st.tabs(["Overview", "Customer segments", "Fraud patterns", "Business actions", "Data & methodology"])
 
-    with col1:
-        total_customers = st.session_state.df_users.shape[0]
-        st.metric("Total Customers", f"{total_customers:,}")
+with overview:
+    left, right = st.columns([1.6, 1])
+    with left:
+        st.subheader("Value over time")
+        chart(monthly_chart(monthly_summary(scope)), "monthly")
+    with right:
+        st.subheader("Customer composition")
+        chart(segment_chart(summary), "composition")
+    left, right = st.columns(2)
+    purchases = scope.loc[scope["is_purchase"]]
+    with left:
+        st.subheader("Where customers spend")
+        categories = purchases.groupby("merchant_category", as_index=False)["amount"].sum().nlargest(8, "amount").sort_values("amount")
+        fig = px.bar(categories, x="amount", y="merchant_category", orientation="h", color_discrete_sequence=PALETTE)
+        fig.update_layout(xaxis_title="Purchase value · USD", yaxis_title=None)
+        chart(polish(fig), "categories")
+    with right:
+        st.subheader("Concentration, measured")
+        spend = purchases.groupby("client_id")["amount"].sum().sort_values(ascending=False)
+        n_top = max(1, math.ceil(len(spend) * 0.2))
+        share = spend.head(n_top).sum() / spend.sum() if spend.sum() else 0
+        st.metric(f"Top {n_top} purchasing customers' share", f"{share:.1%}")
+        st.write(f"The top approximately 20% account for {share:.1%} of positive, error-free purchase value in this scope.")
+        st.caption("This is a measured concentration statistic; the data is not assumed to follow an 80/20 rule.")
+        method = purchases.groupby("use_chip", as_index=False).size()
+        if not method.empty:
+            chart(polish(px.bar(method, x="use_chip", y="size", color_discrete_sequence=[PALETTE[1]]), height=240), "methods")
 
-    with col2:
-        total_transactions = st.session_state.df_trans.shape[0]
-        st.metric("Total Transactions", f"{total_transactions:,}")
+with segments:
+    st.subheader("A consistent RFM view")
+    st.write(f"Window: {(end - pd.Timedelta(days=window_days)).date()} to {end.date()} (exclusive). Purchase activity across all cards; matched customers in the selected scope.")
+    st.caption("Recency = days since latest purchase. Frequency = purchase count. Monetary = gross purchase value. Refunds and error rows are excluded. Equal values receive equal scores.")
+    table(summary, column_config={"purchase_value": st.column_config.NumberColumn(format="$%.2f")})
+    active = profile.loc[profile["Frequency"] > 0]
+    if not active.empty:
+        fig = px.scatter(active, x="Frequency", y="Monetary", color="Segment",
+                         hover_data=["client_id", "Recency"], color_discrete_sequence=PALETTE, log_y=True)
+        chart(polish(fig, height=400), "rfm_scatter")
+    segment_filter = st.multiselect("Inspect customer segments", sorted(profile["Segment"].unique()), default=[])
+    inspected = profile.loc[profile["Segment"].isin(segment_filter)] if segment_filter else profile
+    export_cols = ["client_id", "Segment", "Recency", "Frequency", "Monetary", "R_Score", "F_Score", "M_Score", "has_credit_card"]
+    table(inspected[export_cols])
+    download(inspected[export_cols], "Download customer segments", "customer_segments.csv", "segments_csv")
+    st.caption("Rule-based segmentation, not machine learning. Customers absent from the filtered transaction cohort are not shown; the quality tab reports the full registry.")
 
-    with col3:
-        total_value = st.session_state.df_trans['amount'].sum()
-        st.metric("Total Value", format_currency(total_value))
-
-    with col4:
-        avg_transaction = st.session_state.df_trans['amount'].mean()
-        st.metric("Avg Transaction", f"${avg_transaction:,.2f}")
-
-    with col5:
-        fraud_rate = (st.session_state.df_fraud['target'].sum() / len(st.session_state.df_fraud))
-        st.metric("Fraud Rate", f"{fraud_rate:.2%}")
-
-    st.markdown("---")
-
-    # Top 5 most important insights
-    st.markdown("### 🎯 Top 5 Key Insights")
-
-    # Insight 1: Transaction Trends (Q1)
-    st.markdown("#### 1️⃣ Transaction Trends Over Time (2010-2019)")
-    fig1 = plot_transaction_trends(st.session_state.df_merged)
-    st.plotly_chart(fig1, width='stretch', key='plot_transaction_trends_summary')
-
-    st.markdown('<div class="insight-box">', unsafe_allow_html=True)
-    # Calculate growth metrics
-    yearly_trans = st.session_state.df_merged.groupby('year')['amount'].agg(['sum', 'count'])
-    growth_rate = ((yearly_trans['sum'].iloc[-1] / yearly_trans['sum'].iloc[0]) - 1) * 100
-    st.markdown(f"""
-    **💡 Key Insight:** Transaction volume and value show {'growth' if growth_rate > 0 else 'decline'} of **{abs(growth_rate):.1f}%**
-    from 2010 to 2019. {'Strong upward trend indicates healthy business growth.' if growth_rate > 0 else 'Declining trend requires attention.'}
-    """)
-    st.markdown('</div>', unsafe_allow_html=True)
-
-    st.markdown("---")
-
-    # Insights 2 & 3: Side by side
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.markdown("#### 2️⃣ Customer Spending Distribution (Q2)")
-        fig2 = plot_customer_distribution(st.session_state.df_merged)
-        st.plotly_chart(fig2, width='stretch', key='plot_customer_distribution_summary')
-
-        st.markdown('<div class="insight-box">', unsafe_allow_html=True)
-        st.markdown("""
-        **💡 Key Insight:** The distribution follows the Pareto principle - a small percentage of customers
-        generate majority of revenue. Focus retention efforts on high-value customers.
-        """)
-        st.markdown('</div>', unsafe_allow_html=True)
-
-    with col2:
-        st.markdown("#### 3️⃣ RFM Customer Segments (Q11)")
-        fig3 = plot_rfm_segments(st.session_state.rfm_df)
-        st.plotly_chart(fig3, width='stretch', key='plot_rfm_segments_summary')
-
-        st.markdown('<div class="insight-box">', unsafe_allow_html=True)
-        champions_count = len(st.session_state.rfm_df[st.session_state.rfm_df['Segment'] == 'Champions'])
-        champions_pct = (champions_count / len(st.session_state.rfm_df)) * 100
-        st.markdown(f"""
-        **💡 Key Insight:** **{champions_count:,}** customers ({champions_pct:.1f}%) are in the "Champions" segment
-        with high recency, frequency, and monetary value. These are our most valuable customers.
-        """)
-        st.markdown('</div>', unsafe_allow_html=True)
-
-    st.markdown("---")
-
-    # Insights 4 & 5: Side by side
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.markdown("#### 4️⃣ Lifetime Value by Segment (Q18)")
-        fig4 = plot_segment_ltv(st.session_state.ltv_df, st.session_state.rfm_df)
-        st.plotly_chart(fig4, width='stretch', key='plot_segment_ltv_summary')
-
-        st.markdown('<div class="insight-box">', unsafe_allow_html=True)
-        # Calculate LTV difference
-        ltv_with_seg = st.session_state.ltv_df.merge(
-            st.session_state.rfm_df[['client_id', 'Segment']],
-            on='client_id'
-        )
-        champions_ltv = ltv_with_seg[ltv_with_seg['Segment'] == 'Champions']['LTV'].mean()
-        avg_ltv = ltv_with_seg['LTV'].mean()
-        ltv_multiple = champions_ltv / avg_ltv if avg_ltv > 0 else 0
-        st.markdown(f"""
-        **💡 Key Insight:** Champions segment has **{ltv_multiple:.1f}x** higher LTV than average.
-        Investing in customer retention and upselling to this segment yields highest returns.
-        """)
-        st.markdown('</div>', unsafe_allow_html=True)
-
-    with col2:
-        st.markdown("#### 5️⃣ Credit Card Cross-Sell Opportunities (Q19)")
-        fig5 = plot_crosssell_opportunities(st.session_state.df_merged, st.session_state.df_cards)
-        st.plotly_chart(fig5, width='stretch', key='plot_crosssell_summary')
-
-        st.markdown('<div class="insight-box">', unsafe_allow_html=True)
-        st.markdown("""
-        **💡 Key Insight:** Significant opportunity to cross-sell Credit cards to high-spending Debit users.
-        Target "High" and "Very High" segments first for best conversion rates and revenue impact.
-        """)
-        st.markdown('</div>', unsafe_allow_html=True)
-
-# Tab 2: Customer Behavior
-with tab2:
-    st.markdown('<div class="sub-header">Customer Behavior Analysis</div>', unsafe_allow_html=True)
-    st.markdown("**Questions Q1-Q10**: Comprehensive analysis of customer transaction patterns")
-
-    # Question selector
-    question = st.selectbox(
-        "Select Analysis Question:",
-        [
-            "Q1: Transaction Trends Over Time (2010-2019)",
-            "Q2: Transaction Value Distribution & Top Spenders",
-            "Q3: Payment Method Usage & Trends",
-            "Q4: Top Merchant Categories",
-            "Q5: Gender Spending Comparison",
-            "Q6: Age Group Analysis",
-            "Q7: Income vs Spending Relationship",
-            "Q8: Seasonality Analysis",
-            "Q9: Transaction Frequency",
-            "Q10: Geographic Distribution"
-        ]
-    )
-
-    st.markdown("---")
-
-    # Filters section (common for most questions)
-    with st.expander("🔍 Filters (Optional)", expanded=False):
-        col1, col2, col3, col4 = st.columns(4)
-
-        with col1:
-            gender_filter = st.selectbox(
-                "Gender",
-                options=['All'] + list(st.session_state.df_merged['gender'].dropna().unique()),
-                index=0
-            )
-
-        with col2:
-            age_filter = st.selectbox(
-                "Age Group",
-                options=['All'] + list(st.session_state.df_merged['age_group'].dropna().unique()),
-                index=0
-            )
-
-        with col3:
-            card_filter = st.selectbox(
-                "Card Type",
-                options=['All'] + list(st.session_state.df_merged['card_type'].dropna().unique()),
-                index=0
-            )
-
-        with col4:
-            year_filter = st.selectbox(
-                "Year",
-                options=['All'] + sorted(st.session_state.df_merged['year'].dropna().unique().tolist()),
-                index=0
-            )
-
-    # Build filters dict
-    filters = {}
-    if gender_filter != 'All':
-        filters['gender'] = gender_filter
-    if age_filter != 'All':
-        filters['age_group'] = age_filter
-    if card_filter != 'All':
-        filters['card_type'] = card_filter
-    if year_filter != 'All':
-        filters['year'] = year_filter
-
-    # Display selected chart
-    if "Q1" in question:
-        st.markdown("### Q1: Transaction Trends Over Time (2010-2019)")
-        st.markdown("**Analysis:** How transaction volume and value evolved from 2010 to 2019")
-        fig = plot_transaction_trends(st.session_state.df_merged, filters)
-        st.plotly_chart(fig, width='stretch', key='plot_transaction_trends_q1')
-
-        # Insights
-        st.markdown('<div class="insight-box">', unsafe_allow_html=True)
-        st.markdown("""
-        **💡 Key Insights:**
-        - Track growth/decline trends over the decade
-        - Identify peak periods and growth accelerations
-        - Understand seasonal patterns across years
-        """)
-        st.markdown('</div>', unsafe_allow_html=True)
-
-    elif "Q2" in question:
-        st.markdown("### Q2: Transaction Value Distribution & Top Spenders")
-        st.markdown("**Analysis:** Customer spending distribution following the Pareto principle")
-        fig = plot_customer_distribution(st.session_state.df_merged, filters)
-        st.plotly_chart(fig, width='stretch', key='plot_customer_distribution_q2')
-
-        # Insights
-        st.markdown('<div class="insight-box">', unsafe_allow_html=True)
-        st.markdown("""
-        **💡 Key Insights:**
-        - Understand the concentration of revenue among customers
-        - Identify high-value customer segments
-        - Validate 80-20 rule in your customer base
-        """)
-        st.markdown('</div>', unsafe_allow_html=True)
-
-    elif "Q3" in question:
-        st.markdown("### Q3: Payment Method Usage & Trends")
-        st.markdown("**Analysis:** How different payment methods (Credit/Debit) are used over time")
-        fig = plot_payment_method_trends(st.session_state.df_merged, filters)
-        st.plotly_chart(fig, width='stretch', key='plot_payment_method_q3')
-
-        # Insights
-        st.markdown('<div class="insight-box">', unsafe_allow_html=True)
-        st.markdown("""
-        **💡 Key Insights:**
-        - Track adoption of different payment methods
-        - Identify shifts from Debit to Credit cards
-        - Understand customer payment preferences
-        """)
-        st.markdown('</div>', unsafe_allow_html=True)
-
-    elif "Q4" in question:
-        st.markdown("### Q4: Top Merchant Categories")
-        st.markdown("**Analysis:** Which merchant categories generate the most revenue")
-        fig = plot_top_merchant_categories(st.session_state.df_merged, filters)
-        st.plotly_chart(fig, width='stretch', key='plot_top_merchant_q4')
-
-        # Insights
-        st.markdown('<div class="insight-box">', unsafe_allow_html=True)
-        st.markdown("""
-        **💡 Key Insights:**
-        - Identify most popular spending categories
-        - Focus partnership efforts on high-volume categories
-        - Tailor rewards programs to customer preferences
-        """)
-        st.markdown('</div>', unsafe_allow_html=True)
-
-    elif "Q5" in question:
-        st.markdown("### Q5: Gender Spending Comparison")
-        st.markdown("**Analysis:** How spending patterns differ between male and female customers")
-        fig = plot_gender_spending_comparison(st.session_state.df_merged, filters)
-        st.plotly_chart(fig, width='stretch', key='plot_gender_spending_q5')
-
-        # Insights
-        st.markdown('<div class="insight-box">', unsafe_allow_html=True)
-        st.markdown("""
-        **💡 Key Insights:**
-        - Understand gender-based spending differences
-        - Tailor marketing campaigns by gender
-        - Identify cross-sell opportunities by segment
-        """)
-        st.markdown('</div>', unsafe_allow_html=True)
-
-    elif "Q6" in question:
-        st.markdown("### Q6: Age Group Analysis")
-        st.markdown("**Analysis:** Spending behavior across different age groups")
-        fig = plot_age_group_analysis(st.session_state.df_merged, filters)
-        st.plotly_chart(fig, width='stretch', key='plot_age_group_q6')
-
-        # Insights
-        st.markdown('<div class="insight-box">', unsafe_allow_html=True)
-        st.markdown("""
-        **💡 Key Insights:**
-        - Identify highest-spending age groups
-        - Understand lifecycle-based spending patterns
-        - Target products/services to specific age segments
-        """)
-        st.markdown('</div>', unsafe_allow_html=True)
-
-    elif "Q7" in question:
-        st.markdown("### Q7: Income vs Spending Relationship")
-        st.markdown("**Analysis:** Correlation between customer income and spending behavior")
-        fig = plot_income_vs_spending(st.session_state.df_merged, filters)
-        st.plotly_chart(fig, width='stretch', key='plot_income_vs_spending_q7')
-
-        # Insights
-        st.markdown('<div class="insight-box">', unsafe_allow_html=True)
-        st.markdown("""
-        **💡 Key Insights:**
-        - Validate income-spending correlation
-        - Identify high-spending low-income customers (risk)
-        - Target credit limit increases to high-income customers
-        """)
-        st.markdown('</div>', unsafe_allow_html=True)
-
-    elif "Q8" in question:
-        st.markdown("### Q8: Seasonality Analysis")
-        st.markdown("**Analysis:** Monthly and quarterly spending patterns")
-        fig = plot_seasonality_analysis(st.session_state.df_merged, filters)
-        st.plotly_chart(fig, width='stretch', key='plot_seasonality_q8')
-
-        # Insights
-        st.markdown('<div class="insight-box">', unsafe_allow_html=True)
-        st.markdown("""
-        **💡 Key Insights:**
-        - Identify peak spending months (e.g., holidays)
-        - Plan promotional campaigns around high-spend periods
-        - Understand seasonal cash flow patterns
-        """)
-        st.markdown('</div>', unsafe_allow_html=True)
-
-    elif "Q9" in question:
-        st.markdown("### Q9: Transaction Frequency Distribution")
-        st.markdown("**Analysis:** How often customers transact")
-        fig = plot_transaction_frequency(st.session_state.df_merged, filters)
-        st.plotly_chart(fig, width='stretch', key='plot_transaction_frequency_q9')
-
-        # Insights
-        st.markdown('<div class="insight-box">', unsafe_allow_html=True)
-        st.markdown("""
-        **💡 Key Insights:**
-        - Identify highly active vs occasional customers
-        - Target engagement campaigns to low-frequency users
-        - Reward high-frequency customers with loyalty programs
-        """)
-        st.markdown('</div>', unsafe_allow_html=True)
-
-    elif "Q10" in question:
-        st.markdown("### Q10: Geographic Distribution")
-        st.markdown("**Analysis:** Transaction volume across different states")
-        fig = plot_geographic_distribution(st.session_state.df_merged, filters)
-        st.plotly_chart(fig, width='stretch', key='plot_geographic_q10')
-
-        # Insights
-        st.markdown('<div class="insight-box">', unsafe_allow_html=True)
-        st.markdown("""
-        **💡 Key Insights:**
-        - Identify highest-revenue geographic markets
-        - Focus expansion efforts on high-potential states
-        - Understand regional spending differences
-        """)
-        st.markdown('</div>', unsafe_allow_html=True)
-
-# Tab 3: Segmentation
-with tab3:
-    st.markdown('<div class="sub-header">Customer Segmentation</div>', unsafe_allow_html=True)
-    st.markdown("**Questions Q11-Q13**: Three complementary segmentation approaches")
-
-    seg_type = st.radio(
-        "Select Segmentation Type:",
-        ["Q11: RFM Segmentation", "Q12: Lifecycle Segmentation", "Q13: Financial Health Segmentation"],
-        horizontal=True
-    )
-
-    if "Q11" in seg_type:
-        st.markdown("### Q11: RFM Segmentation")
-        st.markdown("**Recency, Frequency, Monetary** - Behavioral segmentation")
-        fig_rfm = plot_rfm_segments(st.session_state.rfm_df)
-        st.plotly_chart(fig_rfm, use_container_width=True)
-
-    elif "Q12" in seg_type:
-        st.markdown("### Q12: Lifecycle Segmentation")
-        st.markdown("Segments: Young Professionals, Mid-Career, Pre-Retirement, Retirees")
-        # Implementation here
-
+with risk:
+    st.subheader("Observed fraud, with the denominator")
+    a, b, c = st.columns(3)
+    a.metric("Labeled transactions", f'{scope["is_fraud"].notna().sum():,}')
+    b.metric("Observed fraud cases", f'{metrics["fraud_count"]:,}')
+    c.metric("Label coverage", f"{coverage:.1%}")
+    st.caption("Unknown labels stay unknown. Rates are calculated across all labeled transactions, including error rows, within the selected scope.")
+    group = st.selectbox("Compare by", ["merchant_category", "use_chip", "card_type", "merchant_state"])
+    minimum = st.number_input("Minimum labeled transactions per group", min_value=1, value=30, step=10)
+    grouped = risk_by_group(scope, group, int(minimum))
+    if grouped.empty:
+        st.info("No group meets the minimum labeled sample size.")
     else:
-        st.markdown("### Q13: Financial Health Segmentation")
-        st.markdown("Based on Credit Score and Debt-to-Income ratio")
-        # Implementation here
+        plot = grouped.copy()
+        plot["rate_pct"] = plot["rate"].astype(float) * 100
+        plot["plus"] = (plot["ci_high"] - plot["rate"].astype(float)) * 100
+        plot["minus"] = (plot["rate"].astype(float) - plot["ci_low"]) * 100
+        fig = px.bar(plot, x=group, y="rate_pct", error_y="plus", error_y_minus="minus",
+                     color_discrete_sequence=[PALETTE[1]], hover_data=["labeled", "fraud"])
+        fig.update_layout(xaxis_title=None, yaxis_title="Observed fraud rate · %")
+        chart(polish(fig), "risk")
+        table(grouped, column_config={col: st.column_config.NumberColumn(format="%.4f") for col in ["rate", "ci_low", "ci_high"]})
+        download(grouped, "Download risk comparison", "fraud_patterns.csv", "risk_csv")
+    st.warning("These are exploratory associations, not fraud predictions or causal effects. Wilson 95% intervals assume independent observations; repeated customers and incomplete labels can make uncertainty larger.")
 
-# Tab 4: Segment Deep-Dive
-with tab4:
-    st.markdown('<div class="sub-header">Segment Behavior Deep-Dive</div>', unsafe_allow_html=True)
-    st.markdown("**Questions Q14-Q18**: Detailed analysis of each customer segment")
+with actions:
+    st.subheader("From a segment to a testable action")
+    st.caption("Candidate lists are hypotheses for a controlled pilot, not credit approvals or proven financial impact.")
+    a, b = st.columns(2)
+    with a:
+        st.markdown("#### Re-engage valuable inactive customers")
+        st.metric("At-risk candidates", f"{len(retention):,}")
+        st.write("Offer a relevant reactivation message to customers with low recency scores and historically stronger frequency or spending within the lookback window.")
+        st.caption("Pilot: randomize eligible customers into treatment/control. Primary metric: 30-day reactivation rate. Track incentive cost and opt-outs.")
+        out = retention[["client_id", "Recency", "Frequency", "Monetary"]]
+        table(out.head(15))
+        download(out, "Download retention candidates", "retention_candidates.csv", "retention_csv")
+    with b:
+        st.markdown("#### Explore a credit-card proposition")
+        st.metric("Discovery candidates", f"{len(cross_sell):,}")
+        st.write("Select active customers in the top spending quartile who have no Credit card in the supplied card registry.")
+        st.caption("Pilot: validate existing ownership, consent and underwriting eligibility separately. Compare application completion and incremental contribution after costs.")
+        out = cross_sell[["client_id", "Frequency", "Monetary", "has_credit_card"]]
+        table(out.head(15))
+        download(out, "Download discovery candidates", "cross_sell_candidates.csv", "cross_sell_csv")
+    st.info("No uplift, savings or revenue improvement is claimed: no campaign experiment has been run. Spending projections have not been labeled as customer lifetime value.")
 
-    question = st.selectbox(
-        "Select Analysis:",
-        [
-            "Q14: Card Type Preferences by Segment",
-            "Q15: Merchant Category Preferences by Segment",
-            "Q16: Spending Behavior Comparison",
-            "Q17: Credit Limit & Utilization by Segment",
-            "Q18: Lifetime Value (LTV) by Segment"
-        ]
-    )
+with quality:
+    st.subheader("Data quality is part of the result")
+    st.caption("Checks below describe the entire loaded dataset, before dashboard filters.")
+    table(bundle.quality)
+    missing_users = raw.loc[raw["user_match"].ne("both"), "client_id"].nunique()
+    st.write(f"Registry: {len(bundle.users):,} customers. No transaction history: {(~bundle.users['id'].isin(raw['client_id'])).sum():,}. Unmatched transaction customer IDs: {missing_users:,}.")
+    st.markdown("""
+**Metric contract**
+- Net value sums error-free transaction amounts; negative amounts are refunds/reversals.
+- Purchase metrics and RFM use positive, error-free transactions.
+- Fraud rate = positive labels / known labels. Missing labels never become zero.
+- RFM scores use average ranks; recency is reversed. At-risk rules run before loyal rules.
+- Customer age, debt and income are source snapshot attributes, not historical facts.
+- Charts and candidate lists are descriptive; dataset sampling can alter scores and rankings.
+""")
+    st.markdown("**Reproducibility:** one deterministic demo generator, one shared Python pipeline, executable SQLite queries, automated analytical and UI tests. See README and docs/METHODOLOGY.md.")
+    download(bundle.quality, "Download data quality checks", "data_quality.csv", "quality_csv")
 
-    st.markdown(f"Analysis for: **{question}**")
-    # Implementation here
+st.divider()
+st.caption("LedgerLens · Transaction analytics portfolio · Synthetic demo by default · Source and methodology documented in the repository")
 
-# Tab 5: Strategy & Fraud
-with tab5:
-    st.markdown('<div class="sub-header">Strategic Recommendations & Fraud Analysis</div>', unsafe_allow_html=True)
-
-    analysis_type = st.radio(
-        "Select Analysis Type:",
-        ["Strategic Recommendations (Q19-Q23)", "Fraud & Risk Analysis (Q24-Q25)"],
-        horizontal=True
-    )
-
-    if "Strategic" in analysis_type:
-        st.markdown("### Strategic Recommendations")
-        question = st.selectbox(
-            "Select Recommendation:",
-            [
-                "Q19: Credit Card Cross-sell Opportunities",
-                "Q20: Credit Limit Up-sell Opportunities",
-                "Q21: At-Risk Customer Analysis",
-                "Q22: High-Value Customer Retention",
-                "Q23: Product Recommendation Engine"
-            ]
-        )
-        # Implementation here
-    else:
-        st.markdown("### Fraud & Risk Analysis")
-        question = st.selectbox(
-            "Select Analysis:",
-            [
-                "Q24: Fraud Detection Overview",
-                "Q25: Dark Web Exposure & Fraud Correlation"
-            ]
-        )
-        # Implementation here
-
-# Footer
-st.markdown("---")
-st.markdown("""
-<div style='text-align: center; color: #7f8c8d; padding: 2rem 0;'>
-    <p>📊 Company X Financial Analytics Dashboard | Module 2 Final Project | COLE.VN DS K06</p>
-    <p>Built with Streamlit & Plotly | Data: 2010-2019 Financial Transactions</p>
-</div>
-""", unsafe_allow_html=True)
